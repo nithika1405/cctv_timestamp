@@ -1,0 +1,22 @@
+Metadata-Version: 2.4
+Name: cctv-event-monitor
+Version: 0.1.0
+Summary: CCTV object tracking and event review with YOLO, ByteTrack/BoT-SORT, React, FastAPI, and SQLite.
+Requires-Python: >=3.10
+Requires-Dist: ultralytics>=8.2.0
+Requires-Dist: opencv-python-headless>=4.9.0
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: plotly>=5.20.0
+Requires-Dist: fastapi>=0.111.0
+Requires-Dist: uvicorn>=0.30.0
+Requires-Dist: websockets>=13.0
+Requires-Dist: python-multipart>=0.0.9
+Provides-Extra: ai
+Requires-Dist: anthropic>=0.40.0; extra == "ai"
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: ruff>=0.4.0; extra == "dev"
+Requires-Dist: mypy>=1.10.0; extra == "dev"
+Requires-Dist: types-requests; extra == "dev"
+Requires-Dist: httpx>=0.27.0; extra == "dev"

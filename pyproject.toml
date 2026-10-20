@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cctv-event-monitor"
+version = "0.1.0"
+description = "CCTV object tracking and event review with YOLO, ByteTrack/BoT-SORT, React, FastAPI, and SQLite."
+requires-python = ">=3.10"
+dependencies = [
+  "ultralytics>=8.2.0",
+  "opencv-python-headless>=4.9.0",
+  "pandas>=2.0.0",
+  "numpy>=1.24.0",
+  "plotly>=5.20.0",
+  "fastapi>=0.111.0",
+  "uvicorn>=0.30.0",
+  "websockets>=13.0",
+  "python-multipart>=0.0.9",
+]
+
+[project.optional-dependencies]
+ai = [
+  "anthropic>=0.40.0",
+]
+dev = [
+  "pytest>=8.0.0",
+  "ruff>=0.4.0",
+  "mypy>=1.10.0",
+  "types-requests",
+  "httpx>=0.27.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # Line too long (handled by formatter)
+    "B008",  # Do not perform function call in argument defaults
+]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+ignore_missing_imports = true
