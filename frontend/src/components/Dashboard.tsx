@@ -23,6 +23,13 @@ interface DashboardProps {
   }
 }
 
+function formatTime(seconds: number): string {
+  const t = Math.floor(seconds)
+  return [Math.floor(t / 3600), Math.floor((t % 3600) / 60), t % 60]
+    .map((v) => String(v).padStart(2, '0'))
+    .join(':')
+}
+
 const EVENT_LABELS: Record<string, string> = {
   person_entering: 'Person Entering',
   person_leaving: 'Person Leaving',
@@ -49,11 +56,39 @@ const EVENT_COLORS: Record<string, string> = {
   loitering: '#EAB308',
 }
 
-function formatTime(seconds: number): string {
-  const t = Math.floor(seconds)
-  return [Math.floor(t / 3600), Math.floor((t % 3600) / 60), t % 60]
-    .map((v) => String(v).padStart(2, '0'))
-    .join(':')
+function generateVideoSummary(events: EventRow[], durationSeconds: number): string {
+  if (!events || events.length === 0) {
+    return `Analysis complete for ${formatTime(durationSeconds)} of footage. No significant activity or tracked objects detected.`
+  }
+
+  const peopleCount = new Set(events.filter(e => e.object_label === 'person').map(e => e.tracking_id)).size
+  const objects = events.filter(e => e.object_label !== 'person')
+  const unattended = events.filter(e => e.event_type === 'unattended')
+  const breaches = events.filter(e => e.event_type === 'zone_breach' || e.event_type === 'zone_entry')
+  const loitering = events.filter(e => e.event_type === 'loitering')
+
+  let parts: string[] = []
+  parts.push(`Observed ${peopleCount} individual(s) and ${objects.length} object event(s) across ${formatTime(durationSeconds)} of surveillance footage.`)
+
+  if (breaches.length > 0) {
+    const firstBreach = breaches[0]
+    parts.push(`A restricted zone breach was detected at ${formatTime(firstBreach.timestamp_seconds)} by ${firstBreach.object_label}.`)
+  }
+
+  if (unattended.length > 0) {
+    const firstUnattended = unattended[0]
+    parts.push(`An unattended ${firstUnattended.object_label} was flagged at ${formatTime(firstUnattended.timestamp_seconds)}.`)
+  }
+
+  if (loitering.length > 0) {
+    parts.push(`Prolonged loitering activity was recorded.`)
+  }
+
+  if (breaches.length === 0 && unattended.length === 0 && loitering.length === 0) {
+    parts.push(`All observed activity followed standard routine traffic patterns with no high-risk security incidents.`)
+  }
+
+  return parts.join(' ')
 }
 
 type Tab = 'timeline' | 'heatmap' | 'audit'
@@ -229,6 +264,10 @@ export function Dashboard({ videoId, videoMeta }: DashboardProps) {
             </div>
             {videoUrl ? (
               <>
+                <div style={{ marginBottom: 10, padding: '10px 14px', background: 'var(--bg-panel)', borderRadius: 6, border: '1px solid var(--border)', fontSize: 13, color: 'var(--text-h)', lineHeight: 1.5 }}>
+                  <strong style={{ display: 'block', marginBottom: 4, color: 'var(--accent)', fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.06em' }}>Video Summary &amp; Activity Overview</strong>
+                  {generateVideoSummary(events, videoMeta.duration_seconds)}
+                </div>
                 <div
                   style={{
                     display: 'flex',

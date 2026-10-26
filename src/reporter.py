@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 
 class IncidentReporter:
     """Generates structured Markdown security audit reports."""
@@ -138,7 +142,11 @@ class IncidentReporter:
                 return str(first_block.text)
             return str(first_block)
         except Exception as e:
-            return f"*(AI Generation Failed: {e})*\n\n" + self.generate_offline_report(video_meta, events)
+            logger.exception("AI report generation failed")
+            return (
+                "*(AI report generation failed. Falling back to offline report.)*\n\n"
+                + self.generate_offline_report(video_meta, events)
+            )
 
     def generate_report(self, video_meta: dict, events: list[dict], api_key: str | None = None) -> str:
         if api_key:

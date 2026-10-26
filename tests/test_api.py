@@ -1,9 +1,10 @@
 import uuid
 from io import BytesIO
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
-from src.api import AnalysisRequest, app, database
+from src.api import ALLOWED_YOLO_MODELS, ALLOWED_TRACKERS, AnalysisRequest, app, database
 
 
 client = TestClient(app)
@@ -80,10 +81,16 @@ def test_analysis_request_accepts_supported_scene_profiles():
 
 def test_upload_valid_video_returns_hash_and_path():
     content = b"\x00" * 1024  # Minimal dummy video bytes
-    response = client.post(
-        "/api/upload",
-        files={"file": ("test_clip.mp4", BytesIO(content), "video/mp4")},
-    )
+
+    mock_cap = MagicMock()
+    mock_cap.isOpened.return_value = True
+    mock_cap.read.return_value = (True, None)
+
+    with patch("src.api.cv2.VideoCapture", return_value=mock_cap):
+        response = client.post(
+            "/api/upload",
+            files={"file": ("test_clip.mp4", BytesIO(content), "video/mp4")},
+        )
     assert response.status_code == 200
     payload = response.json()
     assert "video_hash" in payload
@@ -93,14 +100,20 @@ def test_upload_valid_video_returns_hash_and_path():
 
 def test_upload_deduplicates_identical_files():
     content = b"\xDE\xAD\xBE\xEF" * 256
-    resp1 = client.post(
-        "/api/upload",
-        files={"file": ("dup1.mp4", BytesIO(content), "video/mp4")},
-    )
-    resp2 = client.post(
-        "/api/upload",
-        files={"file": ("dup2.mp4", BytesIO(content), "video/mp4")},
-    )
+
+    mock_cap = MagicMock()
+    mock_cap.isOpened.return_value = True
+    mock_cap.read.return_value = (True, None)
+
+    with patch("src.api.cv2.VideoCapture", return_value=mock_cap):
+        resp1 = client.post(
+            "/api/upload",
+            files={"file": ("dup1.mp4", BytesIO(content), "video/mp4")},
+        )
+        resp2 = client.post(
+            "/api/upload",
+            files={"file": ("dup2.mp4", BytesIO(content), "video/mp4")},
+        )
     assert resp1.json()["video_hash"] == resp2.json()["video_hash"]
     assert resp1.json()["path"] == resp2.json()["path"]
 
@@ -224,3 +237,50 @@ def test_jobs_endpoint_returns_dict():
     response = client.get("/api/jobs")
     assert response.status_code == 200
     assert "jobs" in response.json()
+
+
+# ── Security validation tests ───────────────────────────────────────────
+
+
+def test_analyze_rejects_disallowed_model_name():
+    response = client.post("/api/analyze", json={
+        "video_path": "data/uploads/test.mp4",
+        "video_hash": "fakehash",
+        "filename": "test.mp4",
+        "model_name": "/tmp/malicious_model.pt",
+    })
+    assert response.status_code == 400
+    assert "Unsupported model" in response.json()["detail"]
+
+
+def test_analyze_rejects_disallowed_tracker():
+    response = client.post("/api/analyze", json={
+        "video_path": "data/uploads/test.mp4",
+        "video_hash": "fakehash",
+        "filename": "test.mp4",
+        "tracker": "../evil_tracker.yaml",
+    })
+    assert response.status_code == 400
+    assert "Unsupported tracker" in response.json()["detail"]
+
+
+def test_analyze_accepts_allowed_model_names():
+    for model in ALLOWED_YOLO_MODELS:
+        req = AnalysisRequest(
+            video_path="data/uploads/test.mp4",
+            video_hash="hash",
+            filename="test.mp4",
+            model_name=model,
+        )
+        assert req.model_name == model
+
+
+def test_upload_rejects_invalid_video_content():
+    """Non-video bytes with a .mp4 extension should be rejected."""
+    content = b"this is not a video file at all"
+    response = client.post(
+        "/api/upload",
+        files={"file": ("fake.mp4", BytesIO(content), "video/mp4")},
+    )
+    assert response.status_code == 400
+    assert "invalid video" in response.json()["detail"].lower()

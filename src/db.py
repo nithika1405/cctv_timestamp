@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
+import time
 from collections.abc import Iterable
 from pathlib import Path
 
@@ -28,6 +30,15 @@ CREATE TABLE IF NOT EXISTS events (
     confidence REAL NOT NULL,
     details TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS jobs (
+    job_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    progress REAL NOT NULL DEFAULT 0.0,
+    metrics TEXT DEFAULT '{}',
+    error TEXT,
+    video_id INTEGER REFERENCES videos(id) ON DELETE SET NULL,
+    finished_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_events_video_time ON events(video_id, timestamp_seconds);
 CREATE INDEX IF NOT EXISTS idx_events_search ON events(object_label, event_type, tracking_id);
@@ -204,3 +215,64 @@ class EventDatabase:
         with self.connect() as connection:
             row = connection.execute("SELECT COUNT(*) FROM events").fetchone()
             return row[0] or 0
+
+    def set_job(
+        self,
+        job_id: str,
+        status: str,
+        progress: float = 0.0,
+        metrics: str = "{}",
+        error: str | None = None,
+        video_id: int | None = None,
+        finished_at: float | None = None,
+    ) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                """INSERT INTO jobs(job_id, status, progress, metrics, error, video_id, finished_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(job_id) DO UPDATE SET
+                     status=excluded.status,
+                     progress=excluded.progress,
+                     metrics=excluded.metrics,
+                     error=excluded.error,
+                     video_id=COALESCE(excluded.video_id, jobs.video_id),
+                     finished_at=COALESCE(excluded.finished_at, jobs.finished_at)""",
+                (job_id, status, progress, metrics, error, video_id, finished_at),
+            )
+
+    def get_job(self, job_id: str) -> dict | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if not row:
+                return None
+            d = dict(row)
+            try:
+                d["metrics"] = json.loads(d["metrics"])
+            except Exception:
+                d["metrics"] = {}
+            return d
+
+    def list_jobs(self) -> dict[str, dict]:
+        with self.connect() as connection:
+            rows = connection.execute("SELECT * FROM jobs").fetchall()
+            result = {}
+            for row in rows:
+                d = dict(row)
+                jid = d["job_id"]
+                try:
+                    d["metrics"] = json.loads(d["metrics"])
+                except Exception:
+                    d["metrics"] = {}
+                result[jid] = d
+            return result
+
+    def evict_stale_jobs(self, ttl_seconds: float) -> None:
+        now = time.monotonic()
+        with self.connect() as connection:
+            rows = connection.execute("SELECT job_id, finished_at FROM jobs WHERE status IN ('completed', 'failed')").fetchall()
+            stale_ids = [
+                row["job_id"] for row in rows
+                if row["finished_at"] is not None and now - row["finished_at"] > ttl_seconds
+            ]
+            if stale_ids:
+                connection.executemany("DELETE FROM jobs WHERE job_id = ?", [(jid,) for jid in stale_ids])

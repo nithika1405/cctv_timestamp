@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -39,8 +40,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
 )
 
 DATA_DIR = Path("data")
@@ -48,6 +49,19 @@ UPLOAD_DIR = DATA_DIR / "uploads"
 HEATMAP_DIR = DATA_DIR / "heatmaps"
 DB_PATH = DATA_DIR / "events.db"
 ALLOWED_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv"}
+ALLOWED_YOLO_MODELS = {
+    "yolo11n.pt",
+    "yolo11s.pt",
+    "yolo11m.pt",
+    "yolo11l.pt",
+    "yolo11x.pt",
+    "yolov8n.pt",
+    "yolov8s.pt",
+    "yolov8m.pt",
+    "yolov8l.pt",
+    "yolov8x.pt",
+}
+ALLOWED_TRACKERS = {"botsort.yaml", "bytetrack.yaml"}
 MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "500"))
 MAX_UPLOAD_SIZE_BYTES = MAX_UPLOAD_SIZE_MB * 1024 * 1024
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
@@ -73,7 +87,8 @@ def compute_hash(file_bytes: bytes) -> str:
 @app.get("/api/health")
 async def get_health():
     counts = _get_database_counts()
-    active_jobs = sum(1 for status in ANALYSIS_JOBS.values() if status.get("status") in {"pending", "running"})
+    jobs = _list_job_states()
+    active_jobs = sum(1 for state in jobs.values() if state.get("status") in {"pending", "running"})
     return {
         "status": "ok",
         "service": "cctv-event-monitor",
@@ -90,14 +105,15 @@ async def get_health():
         },
         "jobs": {
             "active": active_jobs,
-            "total": len(ANALYSIS_JOBS),
+            "total": len(jobs),
         },
     }
 
 
 @app.get("/api/jobs")
 async def list_jobs():
-    return {"jobs": {job_id: state for job_id, state in ANALYSIS_JOBS.items()}}
+    _evict_stale_jobs()
+    return {"jobs": _list_job_states()}
 
 
 @app.get("/api/stats/{video_id}")
@@ -172,6 +188,19 @@ async def upload_video(file: UploadFile = File(...)):
     if not video_path.exists():
         video_path.write_bytes(file_bytes)
 
+    # Validate that the file is actually a readable video
+    cap = cv2.VideoCapture(str(video_path))
+    try:
+        if not cap.isOpened():
+            video_path.unlink(missing_ok=True)
+            raise HTTPException(400, "Invalid video file: could not be opened as video.")
+        ok, _ = cap.read()
+        if not ok:
+            video_path.unlink(missing_ok=True)
+            raise HTTPException(400, "Invalid video file: no readable frames found.")
+    finally:
+        cap.release()
+
     return {
         "filename": file.filename,
         "video_hash": video_hash,
@@ -195,25 +224,48 @@ class AnalysisRequest(BaseModel):
     roi_polygon: list[tuple[float, float]] | None = None
 
 
-# Global state tracking jobs
-ANALYSIS_JOBS: dict[str, dict] = {}
-JOB_TTL_SECONDS = 3600  # Auto-evict completed/failed jobs after 1 hour
+# Thread lock and database-backed job tracking
+JOB_LOCK = threading.Lock()
+JOB_TTL_SECONDS = 3600
+
+
+def _get_job_state(job_id: str) -> dict | None:
+    with JOB_LOCK:
+        return database.get_job(job_id)
+
+
+def _list_job_states() -> dict[str, dict]:
+    with JOB_LOCK:
+        return database.list_jobs()
 
 
 def _evict_stale_jobs() -> None:
-    """Remove completed/failed jobs older than JOB_TTL_SECONDS."""
-    now = time.monotonic()
-    stale = [
-        jid for jid, state in ANALYSIS_JOBS.items()
-        if state["status"] in {"completed", "failed"}
-        and now - state.get("finished_at", now) > JOB_TTL_SECONDS
-    ]
-    for jid in stale:
-        del ANALYSIS_JOBS[jid]
+    with JOB_LOCK:
+        database.evict_stale_jobs(JOB_TTL_SECONDS)
+
+
+@app.get("/api/jobs")
+async def list_jobs():
+    _evict_stale_jobs()
+    return {"jobs": _list_job_states()}
 
 
 @app.post("/api/analyze")
 async def analyze_video(req: AnalysisRequest, background_tasks: BackgroundTasks):
+    # Validate model name against allowed list to prevent arbitrary file loading
+    if req.model_name not in ALLOWED_YOLO_MODELS:
+        allowed = ", ".join(sorted(ALLOWED_YOLO_MODELS))
+        raise HTTPException(
+            400,
+            f"Unsupported model '{req.model_name}'. Allowed models: {allowed}",
+        )
+    if req.tracker not in ALLOWED_TRACKERS:
+        allowed = ", ".join(sorted(ALLOWED_TRACKERS))
+        raise HTTPException(
+            400,
+            f"Unsupported tracker '{req.tracker}'. Allowed trackers: {allowed}",
+        )
+
     # Path traversal protection: ensure video_path is inside UPLOAD_DIR
     resolved_path = Path(req.video_path).resolve()
     upload_dir_resolved = UPLOAD_DIR.resolve()
@@ -229,24 +281,28 @@ async def analyze_video(req: AnalysisRequest, background_tasks: BackgroundTasks)
     _evict_stale_jobs()
 
     job_id = req.video_hash
-    if job_id in ANALYSIS_JOBS and ANALYSIS_JOBS[job_id]["status"] == "running":
+    existing_job = _get_job_state(job_id)
+    if existing_job and existing_job["status"] == "running":
         return {"status": "running", "job_id": job_id}
 
-    ANALYSIS_JOBS[job_id] = {
-        "status": "pending",
-        "progress": 0.0,
-        "metrics": {},
-        "result": None,
-        "error": None,
-        "finished_at": None,
-    }
+    with JOB_LOCK:
+        database.set_job(
+            job_id=job_id,
+            status="pending",
+            progress=0.0,
+            metrics="{}",
+            error=None,
+            video_id=None,
+            finished_at=None,
+        )
 
     background_tasks.add_task(asyncio.to_thread, run_analysis_task, job_id, req)
     return {"status": "started", "job_id": job_id}
 
 
 def run_analysis_task(job_id: str, req: AnalysisRequest):
-    ANALYSIS_JOBS[job_id]["status"] = "running"
+    with JOB_LOCK:
+        database.set_job(job_id=job_id, status="running")
     try:
         analyzer = VideoAnalyzer(
             model_name=req.model_name,
@@ -260,9 +316,13 @@ def run_analysis_task(job_id: str, req: AnalysisRequest):
         )
 
         def progress_cb(frac: float, metrics: dict):
-            if job_id in ANALYSIS_JOBS:
-                ANALYSIS_JOBS[job_id]["progress"] = frac
-                ANALYSIS_JOBS[job_id]["metrics"] = metrics
+            with JOB_LOCK:
+                database.set_job(
+                    job_id=job_id,
+                    status="running",
+                    progress=frac,
+                    metrics=json.dumps(metrics),
+                )
 
         result = analyzer.analyze(
             req.video_path,
@@ -292,13 +352,22 @@ def run_analysis_task(job_id: str, req: AnalysisRequest):
                 roi_coords=json.dumps(req.roi_polygon) if req.roi_polygon else None,
             )
 
-        ANALYSIS_JOBS[job_id]["status"] = "completed"
-        ANALYSIS_JOBS[job_id]["video_id"] = video_id
-        ANALYSIS_JOBS[job_id]["finished_at"] = time.monotonic()
+        with JOB_LOCK:
+            database.set_job(
+                job_id=job_id,
+                status="completed",
+                progress=1.0,
+                video_id=video_id,
+                finished_at=time.monotonic(),
+            )
     except Exception as e:
-        ANALYSIS_JOBS[job_id]["status"] = "failed"
-        ANALYSIS_JOBS[job_id]["error"] = str(e)
-        ANALYSIS_JOBS[job_id]["finished_at"] = time.monotonic()
+        with JOB_LOCK:
+            database.set_job(
+                job_id=job_id,
+                status="failed",
+                error=str(e),
+                finished_at=time.monotonic(),
+            )
 
 
 @app.websocket("/ws/progress/{job_id}")
